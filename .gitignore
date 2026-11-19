@@ -1,0 +1,13 @@
+# Secrets and personal data. Never commit these.
+*.key
+accounts.json
+accounts.json.*
+miner.addr
+sthir-data/
+sthir-offline/
+wallet-backups/
+logs/
+*.removed
+*.b64
+__pycache__/
+*.pyc
