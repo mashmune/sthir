@@ -1,7 +1,7 @@
 # Sthir
 
 An experimental proof-of-work coin and wallet that runs on a phone (Termux on Android) or any Linux computer.
-Pure Python 3 with one dependency (`cryptography`). **This is a research and learning project, not a financial product.**
+Pure Python 3 with one dependency (`cryptography`). **This is an experimental research project, not a financial product.**
 
 > **Disclaimer.** Sthir coins have no price, no promised value and are not an investment. Nobody is selling them.
 > The software is provided as is, with no warranty (see LICENSE). Do not use it to protect money you cannot afford to lose.
@@ -13,7 +13,7 @@ Pure Python 3 with one dependency (`cryptography`). **This is a research and lea
 | Chain | Proof-of-work blocks, halving rewards, difficulty retarget, longest-work fork choice, Ed25519 signatures | Works, tested |
 | Network | HTTP gossip between nodes, peer exchange, sync, saved chain with full re-validation on start | Works, tested on one machine |
 | Wallet page | Profiles with name + password, login/logout, send, receive, ledger, backup text, QR codes (show, save, share, read from gallery), mining on/off | Works in Chromium; QR reading needs Android Chrome |
-| Offline vouchers | "Voucher + Cap" state machine for offline payments, with double-spend detection and a bond | Works as a module; **not enforced by the chain yet** |
+| Offline vouchers | "Voucher + Cap" state machine for offline payments, with double-spend detection and a bond | With `./offline.sh serve --node URL` deposits and payouts are real on-chain transfers (receiver's wallet balance changes after the next block). **The hub is custodial and the chain does not enforce the voucher rules yet** |
 | Verifiable compute | Merkle-committed step traces, spot checks, and a bisection dispute where a phone referees one step | Works on a toy kernel; **not a zero-knowledge proof** |
 | Confidential amounts | Pedersen commitments with range and balance proofs | Works as a module; **unaudited, not wired into the chain** |
 | Relay | Store-and-forward mailbox for encrypted blobs | Works |
@@ -30,7 +30,7 @@ Pure Python 3 with one dependency (`cryptography`). **This is a research and lea
 
 ```
 pkg install -y git python python-cryptography      # on Debian/Ubuntu: sudo apt install git python3 python3-cryptography
-git clone https://github.com/mashmune/sthir
+git clone https://github.com/{{GITHUB_USER}}/sthir
 cd sthir && ./setup.sh
 ```
 
@@ -41,7 +41,12 @@ Then open **http://127.0.0.1:8080**, create a profile (name + password) and back
 | `./start.sh` | run on this phone only (two nodes and the wallet page) |
 | `./start.sh share` | also let phones on the same WiFi join; use only on a WiFi you trust |
 | `./join.sh http://<ip>:5001` | join another phone's node |
+| `./public.sh` | put this phone's node on the internet (free tunnel) and print an address others can `./join.sh` |
+| `./wallet.sh <node address>` | use the wallet against someone else's node, without running or mining here |
+
+Every start also connects to the addresses in `seeds.txt`. Chains only join if they share one reachable node; see "Connecting phones" below.
 | `./stop.sh` | stop everything |
+| `./offline.sh serve --node http://127.0.0.1:5000` | run the hub in chain mode: fund it by sending coins to its address, receivers get paid on-chain |
 | `./offline.sh demo` / `verify` / `zk` | run the offline voucher, verification and zero-knowledge demos |
 | `python3 -m unittest` | run the test suite |
 
@@ -74,3 +79,11 @@ See CONTRIBUTING.md. Report vulnerabilities privately as described in SECURITY.m
 ## License
 
 MIT. See LICENSE.
+
+## Connecting phones
+
+A blockchain is one shared history only while nodes can reach each other. Two phones that each ran `./start.sh` alone are two separate chains. When they later connect, the chain with more total work wins and the other chain's blocks, with the coins mined on them, disappear. So decide who is the host first.
+
+- Same WiFi: host runs `./start.sh share`, others run `./join.sh http://<host ip>:5001`.
+- Over the internet: host runs `./public.sh`, others run `./join.sh https://<printed address>`. The free tunnel address changes on every restart.
+- A permanent network needs one always-on node with a fixed address (a small cloud server). Put its address in `seeds.txt` and push; everyone who updates connects to it automatically.

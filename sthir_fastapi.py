@@ -11,7 +11,8 @@ from fastapi import Body, FastAPI, HTTPException
 import sthir_offline as O
 
 os.makedirs("sthir-offline", exist_ok=True)
-hub = O.Hub("sthir-offline/hub.json")
+_node = os.environ.get("STHIR_NODE")        # e.g. http://127.0.0.1:5000 turns on chain mode
+hub = O.Hub("sthir-offline/hub.json", chain=O.ChainBridge(_node) if _node else None)
 route = O.make_router(hub, O.Relay(), allow_credit=False)
 app = FastAPI(title="Sthir offline node")
 
@@ -37,5 +38,5 @@ def _add(path: str):
     app.post(path)(handler)
 
 
-for _p in ("/voucher/lock", "/voucher/redeem", "/voucher/check", "/voucher/status", "/verify/samples", "/relay/put", "/relay/get"):
+for _p in ("/voucher/lock", "/voucher/redeem", "/voucher/close", "/voucher/check", "/voucher/status", "/hub/balance", "/hub/withdraw", "/hub/sync", "/verify/samples", "/relay/put", "/relay/get"):
     _add(_p)

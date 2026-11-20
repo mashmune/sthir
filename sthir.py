@@ -8,7 +8,7 @@ A minimal, in-process blockchain that follows the whitepaper's rules:
     retargets every N blocks, so the chain keeps a steady block time
   - heaviest-chain rule, so two nodes can sync and converge
 
-This is a learning prototype, not production money. No networking yet:
+This is an experimental prototype, not production money. No networking yet:
 nodes exchange blocks by direct method calls.
 """
 from __future__ import annotations

@@ -20,3 +20,8 @@ start_ui() {
   nohup python3 sthir_ui.py --node http://127.0.0.1:$NP --key wallet.key --port $UP > logs/ui.log 2>&1 &
   echo $! > logs/ui.pid
 }
+# Public seed nodes everyone connects to. One URL per line in seeds.txt (lines starting with # are ignored).
+seed_args() {
+  [ -f seeds.txt ] || return 0
+  grep -v '^[[:space:]]*#' seeds.txt | grep -E '^https?://' | sed 's/^/--peer /' | tr '\n' ' '
+}

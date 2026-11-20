@@ -1,0 +1,5 @@
+# Public Sthir seed nodes. Every phone that starts Sthir tries each address below,
+# so all of them end up on one chain. One address per line.
+# This list is empty because no always-on public node exists yet.
+# When someone runs one (see ./public.sh), add its address here and push it to GitHub,
+# and everyone who updates (git pull) joins the same network.

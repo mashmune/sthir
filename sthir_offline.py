@@ -16,9 +16,14 @@ What this does and does not give
   * Two offline receivers can still BOTH accept the same voucher number. One of them is
     only repaid up to the unspent lock plus the bond. Shops should therefore limit the
     value of each offline sale. The state machine below makes the loss bounded, not zero.
-  * HONEST STATUS: the lock lives inside this hub's own ledger (a JSON file). It is NOT
-    yet enforced by the Sthir chain, so the coins are only truly safe once `lock` and
-    `redeem` become chain transactions (a consensus upgrade, planned, not done here).
+  * CHAIN MODE (`serve --node URL`): the hub is wired to a real Sthir node. Coins are
+    deposited by an ordinary on-chain transfer to the hub's address, and every redeem (or
+    close, or withdraw) is paid out as an ordinary on-chain transfer. The receiver's wallet
+    balance therefore changes on the real chain, after the next block. Without --node the
+    hub keeps a private JSON ledger (demo mode) that no wallet can see.
+  * HONEST STATUS: the lock is still custodial. The hub's key holds the escrowed coins and
+    the chain does not enforce the voucher rules; the hub operator must be trusted. Making
+    `lock` and `redeem` consensus rules is a larger upgrade, planned, not done here.
 
 Book states:    LOCKED -> CLOSED (after expiry + grace, remainder returned)
                        -> SLASHED (fraud proven; bond forfeited)
@@ -41,7 +46,10 @@ import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-from sthir import UNIT, Wallet, verify_sig
+import urllib.error
+
+from sthir import UNIT, Tx, Wallet, verify_sig
+from sthir_net import http_get, http_post, tx_from_dict, tx_to_dict
 
 MAX_BOOK_COUNT = 1000
 MAX_LOCK_SECONDS = 30 * 86400
@@ -79,6 +87,11 @@ def sig_verify(scheme: str, address: str, message: bytes, signature: str) -> boo
 def lock_request(wallet: Wallet, count: int, value: int, expiry: int) -> dict:
     body = {"issuer": wallet.address, "scheme": "ed25519", "count": count, "value": value,
             "expiry": expiry, "nonce": secrets.token_hex(8)}
+    return dict(body, sig=wallet.sign(canon(body)))
+
+
+def withdraw_request(wallet: Wallet, amount: int) -> dict:
+    body = {"account": wallet.address, "scheme": "ed25519", "amount": amount, "nonce": secrets.token_hex(8)}
     return dict(body, sig=wallet.sign(canon(body)))
 
 
@@ -132,6 +145,39 @@ class Receiver:
 
 
 # -------------------------------------------------------------------------- hub
+class ChainError(Exception):
+    pass
+
+
+class ChainBridge:
+    """Talks to a Sthir node over HTTP: reads deposits, sends payouts."""
+    FEE = UNIT // 100            # paid to the miner on each payout, taken out of that payout
+
+    def __init__(self, node_url: str, confirmations: int = 2, get=None, post=None):
+        self.url, self.confirmations = node_url.rstrip("/"), max(1, int(confirmations))
+        self._get, self._post = get or http_get, post or http_post
+
+    def _call(self, fn, *a, **kw):
+        try:
+            return fn(*a, **kw)
+        except urllib.error.HTTPError as e:
+            raise ChainError(e.read().decode(errors="replace")[:200])
+        except (OSError, ValueError) as e:
+            raise ChainError(f"node unreachable ({type(e).__name__})")
+
+    def tip(self) -> int:
+        return int(self._call(self._get, self.url + "/status")["height"])
+
+    def blocks(self) -> list:
+        return self._call(self._get, self.url + "/chain", timeout=30)
+
+    def account(self, addr: str) -> dict:
+        return self._call(self._get, f"{self.url}/account/{addr}")
+
+    def submit(self, tx: Tx) -> dict:
+        return self._call(self._post, self.url + "/tx", tx_to_dict(tx))
+
+
 class HubError(ValueError):
     pass
 
@@ -139,13 +185,17 @@ class HubError(ValueError):
 class Hub:
     """Holds the lock, pays redemptions, detects double use. State lives in a JSON file."""
 
-    def __init__(self, path: str | None = None, wallet: Wallet | None = None, now=time.time):
+    def __init__(self, path: str | None = None, wallet: Wallet | None = None, now=time.time,
+                 chain: "ChainBridge | None" = None):
         self.path, self.now, self.lock = path, now, threading.RLock()
-        self.wallet = wallet or Wallet()
+        self.wallet, self.chain = wallet or Wallet(), chain
         self.s = {"balances": {}, "books": {}, "redeemed": {}, "banned": {}, "burned": 0, "used_nonces": []}
         if path and os.path.exists(path):
             with open(path) as f:
                 self.s = json.load(f)
+        # chain-mode state; older files simply gain these keys
+        for k, v in (("deposits", {}), ("scanned", 0), ("payouts", {}), ("inflight", None), ("sent", [])):
+            self.s.setdefault(k, v)
 
     @property
     def address(self) -> str:
@@ -166,10 +216,126 @@ class Hub:
         return self.s["balances"].get(addr, 0)
 
     def credit(self, addr: str, amount: int):
-        """Fund an account. In a real deployment this mirrors the chain, not a faucet."""
+        """Test faucet for demo mode. With a chain attached, funds only arrive as deposits."""
+        if self.chain:
+            raise HubError("this hub is connected to a chain: send coins to it on-chain instead")
         with self.lock:
             self.s["balances"][addr] = self.balance(addr) + int(amount)
             self._save()
+
+    def _settle(self, addr: str, amount: int):
+        """Pay `amount` to `addr`: on-chain (queued) in chain mode, else the private ledger.
+        Caller holds the lock and saves."""
+        if amount <= 0:
+            return
+        book = self.s["payouts"] if self.chain else self.s["balances"]
+        book[addr] = book.get(addr, 0) + amount
+
+    def pending_payout(self, addr: str) -> int:
+        inf = self.s["inflight"]
+        return self.s["payouts"].get(addr, 0) + (inf["amount"] + inf["fee"] if inf and inf["to"] == addr else 0)
+
+    # ---- chain mode: deposits in, payouts out
+    def sync_deposits(self) -> int:
+        """Credit on-chain transfers to the hub address once they are `confirmations` deep."""
+        if not self.chain:
+            return 0
+        with self.lock:
+            try:
+                limit = self.chain.tip() - self.chain.confirmations + 1
+                blocks = self.chain.blocks()
+            except (ChainError, KeyError, TypeError):
+                return 0
+            n, top = 0, self.s["scanned"]
+            for b in blocks:
+                h = b.get("height", 0)
+                if h <= self.s["scanned"] or h > limit:
+                    continue
+                top = max(top, h)
+                for td in b.get("txs", []):
+                    try:
+                        tx = tx_from_dict(td)
+                    except (KeyError, ValueError, TypeError):
+                        continue
+                    if tx.recipient != self.address or tx.sender == self.address:
+                        continue
+                    if not verify_sig(tx.sender, tx.body(), tx.signature):
+                        continue
+                    tid = tx.txid()
+                    if tid in self.s["deposits"]:
+                        continue
+                    self.s["deposits"][tid] = h
+                    self.s["balances"][tx.sender] = self.balance(tx.sender) + tx.amount
+                    n += 1
+            self.s["scanned"] = top
+            self._save()
+            return n
+
+    def flush_payouts(self) -> int:
+        """Send queued payouts as real transactions, one at a time. Returns how many went out.
+        An intent is saved before each send, so a crash can never pay the same amount twice."""
+        if not self.chain:
+            return 0
+        sent, fee = 0, self.chain.FEE
+        with self.lock:
+            while True:
+                inf = self.s["inflight"]
+                if inf is None:
+                    todo = [(a, m) for a, m in self.s["payouts"].items() if m > fee]
+                    if not todo:
+                        break
+                    addr, gross = todo[0]
+                    try:
+                        nonce = self.chain.account(self.address)["next_nonce"]
+                    except (ChainError, KeyError):
+                        break
+                    inf = {"to": addr, "amount": gross - fee, "fee": fee, "nonce": nonce}
+                    del self.s["payouts"][addr]
+                    self.s["inflight"] = inf
+                    self._save()
+                tx = Tx.create(self.wallet, inf["to"], inf["amount"], inf["fee"], inf["nonce"])
+                try:
+                    self.chain.submit(tx)
+                    ok = True
+                except ChainError:
+                    try:        # a timeout may hide a success: our nonce moved on, so it went in
+                        ok = self.chain.account(self.address)["next_nonce"] > inf["nonce"]
+                    except (ChainError, KeyError):
+                        ok = False
+                if not ok:
+                    break
+                self.s["sent"] = (self.s["sent"] + [{"to": inf["to"], "amount": inf["amount"],
+                                                      "txid": tx.txid(), "at": int(self.now())}])[-200:]
+                self.s["inflight"] = None
+                self._save()
+                sent += 1
+        return sent
+
+    def withdraw(self, req: dict) -> dict:
+        """Move an account's deposited (unlocked) balance back to its own on-chain address."""
+        if not self.chain:
+            raise HubError("this hub has no chain connection")
+        with self.lock:
+            try:
+                body = {k: req[k] for k in ("account", "scheme", "amount", "nonce")}
+                ok = sig_verify(body["scheme"], body["account"], canon(body), req["sig"])
+            except (KeyError, TypeError, SchemeUnavailable) as e:
+                raise HubError(f"malformed withdraw request ({type(e).__name__})")
+            amt = body["amount"]
+            if not ok:
+                raise HubError("withdraw request is not signed by the account")
+            if not isinstance(amt, int) or amt <= self.chain.FEE:
+                raise HubError("amount must be more than the network fee")
+            if body["nonce"] in self.s["used_nonces"]:
+                raise HubError("this request was already used")
+            if self.balance(body["account"]) < amt:
+                raise HubError("not enough unlocked coins at the hub")
+            self.s["balances"][body["account"]] -= amt
+            self.s["used_nonces"].append(body["nonce"])
+            self._settle(body["account"], amt)
+            self._save()
+        sent = self.flush_payouts()
+        return {"queued": amt, "sent_now": sent}
 
     # ---- lock
     def lock_book(self, req: dict) -> dict:
@@ -228,7 +394,7 @@ class Hub:
             if first is None:
                 pay = min(book["value"], rec["remaining"])      # less only if earlier fraud drained the lock
                 self.s["redeemed"][key] = {"to": to, "voucher": v}
-                self.s["balances"][to] = self.balance(to) + pay
+                self._settle(to, pay)
                 rec["remaining"] -= pay
                 rec["shortfall"] += book["value"] - pay
                 self._save()
@@ -243,7 +409,7 @@ class Hub:
             rec["remaining"] -= pay - from_bond
             rec["shortfall"] += book["value"] - pay
             rec["state"] = "SLASHED"
-            self.s["balances"][to] = self.balance(to) + pay
+            self._settle(to, pay)
             self.s["banned"][book["issuer"]] = {"book": book["id"], "n": n, "at": int(self.now()),
                                                 "evidence": [first["voucher"], v]}
             self._save()
@@ -265,6 +431,9 @@ class Hub:
                    "settlement_open_until": rec["book"]["expiry"] + SETTLE_GRACE}
             if first is not None and to is not None:
                 out["paid_to_you"] = first["to"] == to
+                if self.chain and first["to"] == to:
+                    queued = self.pending_payout(to) > 0
+                    out["onchain"] = "queued" if queued else "sent"
             return out
 
     # ---- close
@@ -281,7 +450,7 @@ class Hub:
             if rec["state"] == "SLASHED":
                 self.s["burned"] += rec["bond"]
             issuer = rec["book"]["issuer"]
-            self.s["balances"][issuer] = self.balance(issuer) + back
+            self._settle(issuer, back)
             rec["remaining"] = rec["bond"] = 0
             if rec["state"] != "SLASHED":
                 rec["state"] = "CLOSED"
@@ -350,11 +519,30 @@ def make_router(hub: Hub, relay: Relay, allow_credit: bool = False):
 
     def route(path: str, b: dict) -> dict:
         if path == "/status":
-            return {"hub": hub.address, "books": len(hub.s["books"]), "banned": len(hub.s["banned"])}
+            return {"hub": hub.address, "books": len(hub.s["books"]), "banned": len(hub.s["banned"]),
+                    "chain": bool(hub.chain), "confirmations": hub.chain.confirmations if hub.chain else None,
+                    "network_fee": hub.chain.FEE if hub.chain else 0}
         if path == "/voucher/lock":
+            hub.sync_deposits()
             return hub.lock_book(b)
         if path == "/voucher/redeem":
-            return hub.redeem(b)
+            r = hub.redeem(b)
+            hub.flush_payouts()
+            return r
+        if path == "/voucher/close":
+            need(b, "book")
+            r = hub.close(b["book"])
+            hub.flush_payouts()
+            return r
+        if path == "/hub/balance":
+            need(b, "address")
+            hub.sync_deposits()
+            return {"unlocked": hub.balance(b["address"]), "pending_payout": hub.pending_payout(b["address"]),
+                    "chain": bool(hub.chain)}
+        if path == "/hub/withdraw":
+            return hub.withdraw(b)
+        if path == "/hub/sync":
+            return {"deposits": hub.sync_deposits(), "payouts_sent": hub.flush_payouts()}
         if path == "/voucher/status":
             need(b, "book", "n")
             return hub.voucher_status(b["book"], b["n"], b.get("to"))
@@ -372,7 +560,7 @@ def make_router(hub: Hub, relay: Relay, allow_credit: bool = False):
         if path == "/relay/get":
             need(b, "token")
             return relay.get(b["token"], b.get("ack"))
-        if path == "/admin/credit" and allow_credit:
+        if path == "/admin/credit" and allow_credit and not hub.chain:
             need(b, "address", "amount")
             hub.credit(b["address"], int(b["amount"]))
             return {"balance": hub.balance(b["address"])}
@@ -477,6 +665,8 @@ def main():
     s.add_argument("--host", default="127.0.0.1")
     s.add_argument("--data", default="sthir-offline")
     s.add_argument("--demo-credit", action="store_true", help="enable /admin/credit (test coins). Never on a public host.")
+    s.add_argument("--node", default=None, help="Sthir node URL, e.g. http://127.0.0.1:5000. Turns on chain mode: real deposits and payouts.")
+    s.add_argument("--confirmations", type=int, default=2, help="blocks a deposit must be buried under (chain mode)")
     a = ap.parse_args()
     if a.cmd == "demo":
         return demo()
@@ -493,7 +683,19 @@ def main():
         fd = os.open(keyf, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
         with os.fdopen(fd, "w") as f:
             f.write(raw)
-    hub = Hub(os.path.join(a.data, "hub.json"), w)
+    bridge = ChainBridge(a.node, a.confirmations) if a.node else None
+    hub = Hub(os.path.join(a.data, "hub.json"), w, chain=bridge)
+    if bridge:
+        def _loop():
+            while True:
+                try:
+                    hub.sync_deposits()
+                    hub.flush_payouts()
+                except Exception:
+                    pass
+                time.sleep(20)
+        threading.Thread(target=_loop, daemon=True).start()
+        print(f"Chain mode: deposits and payouts go through {bridge.url}. Send coins to the hub address to fund an account.")
     srv = ThreadingHTTPServer((a.host, a.port), make_handler(make_router(hub, Relay(), a.demo_credit)))
     srv.daemon_threads = True
     print(f"Sthir offline hub {hub.address[:12]}... on http://{a.host}:{a.port}")
