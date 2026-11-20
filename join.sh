@@ -11,7 +11,7 @@ fi
 begin
 IP=$(lan_ip)
 # A separate data folder, so an old solo chain can never overwrite the network's chain.
-nohup python3 sthir_net.py node --port $NP --host 0.0.0.0 --advertise http://$IP:$NP --peer "$1" $(seed_args) $(miner_arg) --data sthir-data/joined $RULES > logs/node1.log 2>&1 &
+nohup python3 sthir_net.py node --port $NP --host 0.0.0.0 --advertise http://$IP:$NP --peer "$1" --discover --seeds-url "$SEEDS_URL" $(seed_args) $(miner_arg) --data sthir-data/joined $RULES > logs/node1.log 2>&1 &
 echo $! > logs/node1.pid
 start_ui
 sleep 2

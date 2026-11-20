@@ -38,11 +38,11 @@ Then open **http://127.0.0.1:8080**, create a profile (name + password) and back
 
 | Command | What it does |
 |---|---|
-| `./start.sh` | run on this phone only (two nodes and the wallet page) |
-| `./start.sh share` | also let phones on the same WiFi join; use only on a WiFi you trust |
+| `./start.sh` | run Sthir. Finds other Sthir phones on the same WiFi by itself and reads the public node list (`seeds.txt`) |
+| `./start.sh solo` | this phone only (two nodes and the wallet page); nobody can connect |
 | `./join.sh http://<ip>:5001` | join another phone's node |
-| `./public.sh` | put this phone's node on the internet (free tunnel) and print an address others can `./join.sh` |
-| `./wallet.sh <node address>` | use the wallet against someone else's node, without running or mining here |
+| `./public.sh` | put this phone's node on the internet (free tunnel) and publish its address in `seeds.txt` so other phones find it |
+| `./wallet.sh [node address]` | use the wallet against someone else's node (found automatically on the WiFi or in `seeds.txt`), without running or mining here |
 
 Every start also connects to the addresses in `seeds.txt`. Chains only join if they share one reachable node; see "Connecting phones" below.
 | `./stop.sh` | stop everything |
@@ -82,8 +82,11 @@ MIT. See LICENSE.
 
 ## Connecting phones
 
-A blockchain is one shared history only while nodes can reach each other. Two phones that each ran `./start.sh` alone are two separate chains. When they later connect, the chain with more total work wins and the other chain's blocks, with the coins mined on them, disappear. So decide who is the host first.
+A blockchain is one shared history only while nodes can reach each other. Two phones that ran separately are two separate chains. When they meet, the chain with more total work wins and the other chain's blocks, with the coins mined on them, disappear. This is how every proof-of-work chain behaves.
 
-- Same WiFi: host runs `./start.sh share`, others run `./join.sh http://<host ip>:5001`.
-- Over the internet: host runs `./public.sh`, others run `./join.sh https://<printed address>`. The free tunnel address changes on every restart.
-- A permanent network needs one always-on node with a fixed address (a small cloud server). Put its address in `seeds.txt` and push; everyone who updates connects to it automatically.
+- Same WiFi: just run `./start.sh` on each phone. Nodes announce themselves on the WiFi and connect by themselves. (Some routers block phone-to-phone traffic; then use `./join.sh http://<ip>:5001`.)
+- Over the internet: phones behind mobile data or home WiFi cannot be reached directly, so one phone runs `./public.sh`. It opens a free tunnel and writes the address into `seeds.txt` on GitHub. Every phone re-reads that file every 5 minutes and connects.
+- The free tunnel address changes whenever `./public.sh` restarts, and the network exists only while some node is running. A permanent network needs one always-on node with a fixed address (a small cloud server); put its address in `seeds.txt`.
+- Not running a node at all: `./wallet.sh` opens your wallet against someone else's node. Mining needs your own node.
+- Whoever controls `seeds.txt` in the repository decides which public nodes everyone connects to. Blocks are still checked by every node, so a bad seed cannot forge coins, but it can keep a phone from seeing the real chain.
+- Anyone on the same WiFi can reach a node started with `./start.sh`. Use `./start.sh solo` on a WiFi you do not trust.

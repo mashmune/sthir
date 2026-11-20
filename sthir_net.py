@@ -22,6 +22,7 @@ import argparse
 import json
 import os
 import shutil
+import socket
 import subprocess
 import sys
 import tempfile
@@ -43,6 +44,48 @@ from sthir import (
 
 MAX_BODY = 8 * 1024 * 1024
 POLL_SECONDS = 8
+DISCOVERY_PORT = 5099        # UDP; nodes on one WiFi announce themselves here
+MAX_PEER_FAILS = 30          # polls in a row (about 4 minutes) before a dead peer is dropped
+
+
+# ------------------------------------------------------------- finding other nodes
+def beacon_message(url: str, rules: list) -> bytes:
+    return json.dumps({"sthir": 1, "url": url, "rules": rules}, separators=(",", ":")).encode()
+
+
+def parse_beacon(data: bytes, src_ip: str, rules: list):
+    """The node URL announced by a LAN beacon, or None. The announced host must be the
+    machine that actually sent the packet, so a beacon cannot point us at someone else."""
+    try:
+        if len(data) > 512:
+            return None
+        m = json.loads(data)
+        url = m["url"]
+        if m.get("sthir") != 1 or m["rules"] != rules or not valid_url(url):
+            return None
+        if urlparse(url).hostname != src_ip:
+            return None
+        return url.rstrip("/")
+    except (ValueError, KeyError, TypeError, AttributeError):
+        return None
+
+
+def parse_seeds(text: str, allow_http: bool = False) -> list:
+    """Seed addresses from a seeds file: one URL per line, # starts a comment. Only https
+    unless the operator pointed us at an http seed list themselves."""
+    out = []
+    for line in text.splitlines():
+        line = line.strip()
+        ok = line.startswith("https://") or (allow_http and line.startswith("http://"))
+        if ok and valid_url(line) and line not in out:
+            out.append(line)
+    return out[:10]
+
+
+def fetch_seeds(seeds_url: str) -> list:
+    with urllib.request.urlopen(seeds_url, timeout=8) as r:
+        text = r.read(65536).decode("utf-8", "replace")
+    return parse_seeds(text, allow_http=seeds_url.startswith("http://"))
 
 
 def log(*a):
@@ -215,6 +258,7 @@ class NetNode:
         self.vault_dir: str | None = None   # where sealed account backups are kept
         self.vaults: dict[str, str] = {}
         self.vault_hits: dict[str, list[float]] = {}
+        self.fails: dict[str, int] = {}
 
     def _refresh_known(self):
         self.known = {b.hash() for b in self.node.chain}
@@ -437,6 +481,7 @@ class NetNode:
             for p in peers:
                 try:
                     st = http_get(p + "/status", timeout=4)
+                    self.fails.pop(p, None)
                     if not self.rules_match(p, st):
                         continue
                     with self.lock:
@@ -446,7 +491,72 @@ class NetNode:
                     for q in http_get(p + "/peers", timeout=4)["peers"]:
                         self.add_peer(q)
                 except Exception:
+                    self.fails[p] = self.fails.get(p, 0) + 1
+                    if self.fails[p] >= MAX_PEER_FAILS:      # gone: forget it, it can be found again
+                        with self.lock:
+                            self.peers.discard(p)
+                        self.fails.pop(p, None)
+                        log("peer dropped (unreachable):", p)
+
+    def seeds_loop(self, seeds_url: str, every: int = 300):
+        """Re-read a published seeds file now and then, so a new public node is found
+        without updating the software."""
+        while not self.stop.is_set():
+            try:
+                for sd in fetch_seeds(seeds_url):
+                    self.connect_seed(sd)
+            except Exception as e:
+                log(f"seeds list not reachable for now: {type(e).__name__}")
+            if self.stop.wait(every):
+                return
+
+    def beacon_loop(self, port: int, target: str | None = None):
+        """Announce this node on the local WiFi every 10 seconds."""
+        host = urlparse(self.url).hostname or ""
+        if not target and (host.startswith("127.") or host.count(".") != 3):
+            return                                   # not on a LAN address: nothing to announce
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+        if target:
+            h, _, pt = target.partition(":")
+            dests = [(h, int(pt))]
+        else:
+            dests = [("255.255.255.255", port), (host.rsplit(".", 1)[0] + ".255", port)]
+        while not self.stop.is_set():
+            msg = beacon_message(self.url, self.rules())
+            for d in dests:
+                try:
+                    sock.sendto(msg, d)
+                except OSError:
                     pass
+            if self.stop.wait(10):
+                return
+
+    def listen_loop(self, port: int):
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        if hasattr(socket, "SO_REUSEPORT"):
+            try:
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+            except OSError:
+                pass
+        try:
+            sock.bind(("", port))
+        except OSError as e:
+            log(f"cannot listen for nearby nodes on UDP {port}: {e}")
+            return
+        sock.settimeout(1)
+        while not self.stop.is_set():
+            try:
+                data, (ip, _) = sock.recvfrom(1024)
+            except socket.timeout:
+                continue
+            except OSError:
+                return
+            url = parse_beacon(data, ip, self.rules())
+            if url and url != self.url and url not in self.peers and url not in self.rejected:
+                log("found a node on this network:", url)
+                threading.Thread(target=self.connect_seed, args=(url,), daemon=True).start()
 
     def connect_seed(self, seed: str):
         seed = seed.rstrip("/")
@@ -557,6 +667,14 @@ def make_handler(nn: NetNode):
                 raise ValueError("body too large")
             return json.loads(self.rfile.read(n) or b"{}")
 
+        def _local_ui(self) -> bool:
+            """Only the wallet on this same device may change miner settings. A request that
+            came through a tunnel or proxy (it carries forwarding headers) is never local."""
+            return (self.client_address[0] in ("127.0.0.1", "::1")
+                    and self.headers.get("X-Sthir-UI") == "1"
+                    and not any(self.headers.get(h) for h in
+                                ("X-Forwarded-For", "Cf-Connecting-Ip", "Forwarded", "X-Real-Ip")))
+
         def do_GET(self):
             path = urlparse(self.path).path.rstrip("/")
             if path == "/status":
@@ -592,13 +710,11 @@ def make_handler(nn: NetNode):
                     return self._send(200, {"result": nn.receive_tx(body)})
                 if path == "/miner":
                     # Only the wallet on this same device may change where rewards go.
-                    if (self.client_address[0] not in ("127.0.0.1", "::1")
-                            or self.headers.get("X-Sthir-UI") != "1"):
+                    if not self._local_ui():
                         return self._send(403, {"error": "forbidden"})
                     return self._send(200, {"miner": nn.set_miner(body.get("address"))})
                 if path == "/mining":
-                    if (self.client_address[0] not in ("127.0.0.1", "::1")
-                            or self.headers.get("X-Sthir-UI") != "1"):
+                    if not self._local_ui():
                         return self._send(403, {"error": "forbidden"})
                     return self._send(200, {"mining": nn.set_mining(body.get("on"))})
                 if path == "/peer":
@@ -643,6 +759,11 @@ def cmd_node(a):
     for seed in a.peer or []:
         nn.connect_seed(seed)
     threading.Thread(target=nn.poll_loop, daemon=True).start()
+    if a.seeds_url:
+        threading.Thread(target=nn.seeds_loop, args=(a.seeds_url,), daemon=True).start()
+    if a.discover:
+        threading.Thread(target=nn.listen_loop, args=(a.discovery_port,), daemon=True).start()
+        threading.Thread(target=nn.beacon_loop, args=(a.discovery_port, a.discovery_target), daemon=True).start()
     if miner:
         threading.Thread(target=nn.miner_loop, daemon=True).start()
     try:
@@ -671,6 +792,50 @@ def cmd_send(a):
         print(http_post(f"{a.node}/tx", tx_to_dict(tx)))
     except urllib.error.HTTPError as e:
         print("rejected:", e.read().decode())
+
+
+def cmd_discover(a):
+    """Print the address of a working node: one announced on this WiFi, else one from the seeds file."""
+    found, rules = [], None
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    if hasattr(socket, "SO_REUSEPORT"):
+        try:
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+        except OSError:
+            pass
+    try:
+        sock.bind(("", a.discovery_port))
+        sock.settimeout(1)
+    except OSError:
+        sock = None
+    end = time.time() + a.seconds
+    while time.time() < end and sock:
+        try:
+            data, (ip, _) = sock.recvfrom(1024)
+        except (socket.timeout, OSError):
+            continue
+        try:
+            m = json.loads(data)
+            url = m["url"]
+            if m.get("sthir") == 1 and valid_url(url) and urlparse(url).hostname == ip:
+                found.append(url.rstrip("/"))
+                break
+        except (ValueError, KeyError, TypeError):
+            pass
+    if a.seeds_url:
+        try:
+            found += fetch_seeds(a.seeds_url)
+        except Exception:
+            pass
+    for u in found:
+        try:
+            http_get(u + "/status", timeout=5)
+            print(u)
+            return 0
+        except Exception:
+            continue
+    return 1
 
 
 def cmd_balance(a):
@@ -795,6 +960,11 @@ def main():
                    "(default sthir-data/<port>)")
     n.add_argument("--no-save", action="store_true",
                    help="keep the chain in memory only")
+    n.add_argument("--discover", action="store_true",
+                   help="find other nodes on the same WiFi automatically (and announce this one)")
+    n.add_argument("--discovery-port", type=int, default=DISCOVERY_PORT, help=argparse.SUPPRESS)
+    n.add_argument("--discovery-target", help=argparse.SUPPRESS)
+    n.add_argument("--seeds-url", help="a published seeds file to re-read every 5 minutes")
     n.set_defaults(fn=cmd_node)
 
     s = sub.add_parser("send", help="send coins")
@@ -809,6 +979,12 @@ def main():
     b.add_argument("--node", required=True)
     b.add_argument("who", help="key file or address")
     b.set_defaults(fn=cmd_balance)
+
+    dv = sub.add_parser("discover", help="print the address of a node on this WiFi or from the seeds file")
+    dv.add_argument("--seconds", type=int, default=12)
+    dv.add_argument("--seeds-url")
+    dv.add_argument("--discovery-port", type=int, default=DISCOVERY_PORT, help=argparse.SUPPRESS)
+    dv.set_defaults(fn=cmd_discover)
 
     st = sub.add_parser("status", help="show node status")
     st.add_argument("--node", required=True)
