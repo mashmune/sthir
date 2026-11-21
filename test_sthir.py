@@ -208,6 +208,33 @@ class RetargetTests(unittest.TestCase):
         self.assertEqual(a.total_work(), b.total_work())
         self.assertGreater(a.next_difficulty(), RP.initial_difficulty)
 
+class StaleMempoolTests(unittest.TestCase):
+    def test_stale_payment_is_dropped_and_mining_continues(self):
+        pp = Params(blocks_per_year=20, difficulty_bits=4)
+        a, b = Node(pp, "a"), Node(pp, "b")
+        w, m = Wallet(), Wallet()
+        for _ in range(2):
+            a.mine(w.address)
+        for _ in range(5):
+            b.mine(m.address)                       # a heavier chain where w has nothing
+        a.submit_tx(Tx.create(w, m.address, UNIT, UNIT // 1000, 0))
+        self.assertTrue(a.sync_from(b))
+        self.assertEqual(a.mempool, [])             # the stale payment was pruned
+        a.mine(m.address)                           # and mining works
+
+    def test_miner_skips_a_bad_payment_but_keeps_good_ones(self):
+        pp = Params(blocks_per_year=20, difficulty_bits=4)
+        a = Node(pp, "a")
+        w, v, m = Wallet(), Wallet(), Wallet()
+        a.mine(w.address)
+        a.mine(v.address)
+        good = Tx.create(w, m.address, UNIT, UNIT // 1000, 0)
+        a.submit_tx(good)
+        a.mempool.append(Tx.create(v, m.address, 10 ** 15, 0, 0))     # cannot be paid
+        blk = a.mine(m.address)
+        self.assertEqual([t.txid() for t in blk.txs], [good.txid()])
+        self.assertEqual(a.mempool, [])
+
 
 if __name__ == "__main__":
     unittest.main()

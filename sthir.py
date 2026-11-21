@@ -249,7 +249,22 @@ class Node:
         self.work += diff
         self.balances, self.nonces, self.supply = balances, nonces, new_supply
         included = {t.txid() for t in block.txs}
-        self.mempool = [t for t in self.mempool if t.txid() not in included]
+        self.mempool = self.spendable([t for t in self.mempool if t.txid() not in included])
+
+    def spendable(self, txs: list) -> list:
+        """The transactions, in order, that are still valid on the current chain. A payment
+        can go stale when the chain changes under it (a reorg, or the sender's coins were on
+        the abandoned branch). One stale payment must never stop a node from mining."""
+        bal, non, out = dict(self.balances), dict(self.nonces), []
+        for tx in txs:
+            if (tx.amount > 0 and tx.fee >= 0 and non.get(tx.sender, 0) == tx.nonce
+                    and bal.get(tx.sender, 0) >= tx.amount + tx.fee
+                    and verify_sig(tx.sender, tx.body(), tx.signature)):
+                bal[tx.sender] -= tx.amount + tx.fee
+                bal[tx.recipient] = bal.get(tx.recipient, 0) + tx.amount
+                non[tx.sender] = tx.nonce + 1
+                out.append(tx)
+        return out
 
     def submit_tx(self, tx: Tx) -> None:
         """Mempool admission: same checks a block would apply, on top of mempool."""
@@ -266,7 +281,7 @@ class Node:
 
     # ---------------------------------------------------------------- mining
     def mine(self, miner_address: str, timestamp: int | None = None) -> Block:
-        txs = list(self.mempool)
+        txs = self.spendable(self.mempool)
         height = self.tip.height + 1
         block = Block(
             height=height,
@@ -311,7 +326,7 @@ class Node:
         self.chain, self.diffs, self.work = chain, diffs, work
         self.balances, self.nonces, self.supply = balances, nonces, supply
         on_chain = {t.txid() for b in self.chain for t in b.txs}
-        self.mempool = [t for t in self.mempool if t.txid() not in on_chain]
+        self.mempool = self.spendable([t for t in self.mempool if t.txid() not in on_chain])
         return True
 
     def sync_from(self, other: "Node") -> bool:

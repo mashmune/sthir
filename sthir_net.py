@@ -587,7 +587,8 @@ class NetNode:
                 block = Block(
                     height, tip.hash(), max(int(time.time()), tip.timestamp),
                     self.miner, block_reward(height, self.node.supply, p),
-                    list(self.node.mempool))
+                    self.node.spendable(self.node.mempool))
+                template_mempool = len(self.node.mempool)
             found = False
             while not self.stop.is_set():
                 for _ in range(2000):
@@ -602,6 +603,8 @@ class NetNode:
                 with self.lock:
                     if self.node.tip.hash() != block.prev_hash:
                         break  # someone else found a block; restart on new tip
+                    if len(self.node.mempool) != template_mempool:
+                        break  # a new payment arrived: rebuild so it goes into THIS block
             if not found or not self.mining:
                 continue
             with self.lock:
